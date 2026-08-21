@@ -25,7 +25,7 @@ async function getStatus(): Promise<unknown> {
 
   return {
     service: "agent3",
-    model: process.env.MODEL ?? "qwen2.5:7b",
+    model: process.env.MODEL ?? "deepseek-r1:8b",
     ollama_url: process.env.OLLAMA_URL ?? "http://localhost:11434",
     ollama_reachable: await ollamaReachable(),
     xrpl_endpoint: "wss://xrplcluster.com",

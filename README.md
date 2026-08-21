@@ -24,7 +24,8 @@ cloudflared tunnel --url http://localhost:3100
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `OLLAMA_URL` | `http://localhost:11434` | Local Ollama |
-| `MODEL` | `qwen2.5:7b` | Tool-calling chat model |
+| `MODEL` | `deepseek-r1:8b` | Quality model for `/v1/chat` and `/v1/trade-advice` |
+| `MODEL_FAST` | `qwen2.5:7b` | Fast model for `/v1/sentiment` and `/v1/decision` |
 | `XRPL_WALLET_SEED` | empty | Family seed only; never hardcoded |
 | `PORT` | `3100` | HTTP port |
 | `MAX_BUY_XRP` | `10` | Cap for `buy_token` |
@@ -35,8 +36,11 @@ XRPL websocket: `wss://xrplcluster.com`.
 
 ## Routes
 
-- `POST /v1/chat` — `{ "prompt": "...", "context": optional }` runs the Ollama tool loop
-- `GET /health` — `{ "status": "ok", "model", "uptime" }`
+- `POST /v1/chat` — `{ "prompt": "...", "context": optional }` quality model + tool loop
+- `POST /v1/trade-advice` — trade recommendation using the quality model
+- `POST /v1/decision` — TradeDesk buy/skip using the fast model
+- `POST /v1/sentiment` — `{ "text": "..." }` bullish/bearish/neutral using the fast model
+- `GET /health` — `{ "status": "ok", "model", "model_fast", "uptime" }`
 - `GET /v1/tools` — tool names and descriptions
 
 ## Tools
