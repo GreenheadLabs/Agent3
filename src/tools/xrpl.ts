@@ -4,8 +4,10 @@ import {
   dropsToXrp,
   xrpToDrops,
   PaymentFlags,
+  OfferCreateFlags,
   type Amount,
   type IssuedCurrencyAmount,
+  type OfferCreate,
   type Payment,
   type TrustSet,
 } from "xrpl";
@@ -477,6 +479,134 @@ async function buyToken(args: Record<string, unknown>): Promise<unknown> {
   };
 }
 
+async function quoteXrpOut(
+  xrpl: Client,
+  currency: string,
+  issuer: string,
+  tokenIn: number,
+): Promise<{ expectedXrp: number; source: string }> {
+  try {
+    const amm = await xrpl.request({
+      command: "amm_info",
+      asset: { currency: "XRP" },
+      asset2: { currency, issuer },
+    });
+    const a = amountParts(amm.result.amm.amount as Amount);
+    const b = amountParts(amm.result.amm.amount2 as Amount);
+    const xrpReserve = a.currency === "XRP" ? a.value : b.value;
+    const tokenReserve = a.currency === "XRP" ? b.value : a.value;
+    const fee = Number(amm.result.amm.trading_fee) / 100_000;
+    const effectiveIn = tokenIn * (1 - fee);
+    const expectedXrp = xrpReserve - (xrpReserve * tokenReserve) / (tokenReserve + effectiveIn);
+    if (expectedXrp > 0) {
+      return { expectedXrp, source: "amm" };
+    }
+  } catch {
+    // Fall through to DEX book.
+  }
+
+  const book = await xrpl.request({
+    command: "book_offers",
+    taker_gets: { currency: "XRP" },
+    taker_pays: { currency, issuer },
+    limit: 5,
+  });
+  const offer = book.result.offers[0];
+  if (!offer) {
+    throw new Error("No AMM pool or DEX offers to quote this sell");
+  }
+  const gets = amountParts(offer.TakerGets as Amount);
+  const pays = amountParts(offer.TakerPays as Amount);
+  if (pays.value <= 0) {
+    throw new Error("DEX offer has zero token size");
+  }
+  return { expectedXrp: tokenIn * (gets.value / pays.value), source: "xrpl_dex" };
+}
+
+function maxSellSlippageBps(): number {
+  const parsed = Number(process.env.MAX_SELL_SLIPPAGE_BPS);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 300;
+}
+
+function formatIssuedValue(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error("Issued amount must be positive");
+  }
+  return Number(value.toPrecision(15)).toString();
+}
+
+export async function buy_token(args: Record<string, unknown>): Promise<unknown> {
+  return buyToken(args);
+}
+
+export async function sell_token(args: Record<string, unknown> = {}): Promise<unknown> {
+  const currency = asString(args.currency);
+  const issuer = asString(args.issuer);
+  const amountTokens = asNumber(args.amountTokens) ?? asNumber(args.amount);
+  if (!currency || isXrp(currency)) {
+    throw new Error("sell_token requires an issued currency");
+  }
+  if (!issuer) {
+    throw new Error("issuer is required");
+  }
+  if (amountTokens === undefined || amountTokens <= 0) {
+    throw new Error("amountTokens must be a positive number");
+  }
+
+  const wallet = getWallet();
+  const xrpl = await getXrplClient();
+  const encoded = toXrplCurrency(currency);
+  const lines = await xrpl.request({
+    command: "account_lines",
+    account: wallet.classicAddress,
+    peer: issuer,
+    ledger_index: "validated",
+  });
+  const line = lines.result.lines.find((entry) => entry.currency === encoded);
+  const balance = line ? Number(line.balance) : 0;
+  if (balance < amountTokens) {
+    throw new Error(`Insufficient token balance: have ${balance}, need ${amountTokens}`);
+  }
+
+  const quote = await quoteXrpOut(xrpl, encoded, issuer, amountTokens);
+  const slippageBps = maxSellSlippageBps();
+  const minXrp = quote.expectedXrp * (1 - slippageBps / 10_000);
+  if (minXrp <= 0) {
+    throw new Error("Computed minimum XRP proceeds are not positive");
+  }
+
+  const offer: OfferCreate = {
+    TransactionType: "OfferCreate",
+    Account: wallet.classicAddress,
+    TakerGets: {
+      currency: encoded,
+      issuer,
+      value: formatIssuedValue(amountTokens),
+    },
+    TakerPays: xrpToDrops(minXrp),
+    Flags: OfferCreateFlags.tfFillOrKill | OfferCreateFlags.tfSell,
+  };
+
+  const submitted = await xrpl.submitAndWait(offer, { wallet, autofill: true });
+  const resultCode =
+    submitted.result.meta && typeof submitted.result.meta === "object"
+      ? (submitted.result.meta as { TransactionResult?: string }).TransactionResult
+      : undefined;
+
+  return {
+    status: resultCode ?? "unknown",
+    hash: submitted.result.hash,
+    account: wallet.classicAddress,
+    currency: decodeCurrency(encoded),
+    issuer,
+    tokens_sold: amountTokens,
+    min_xrp: minXrp,
+    expected_xrp: quote.expectedXrp,
+    slippage_bps: slippageBps,
+    quote_source: quote.source,
+  };
+}
+
 async function checkBalance(args: Record<string, unknown>): Promise<unknown> {
   const xrpl = await getXrplClient();
   const address = asString(args.address) ?? getWallet().classicAddress;
@@ -575,7 +705,31 @@ export const xrplTools: AgentTool[] = [
       },
       required: ["currency", "issuer", "xrp_amount"],
     },
-    execute: buyToken,
+    execute: buy_token,
+  },
+  {
+    name: "sell_token",
+    description:
+      "Sell an issued XRPL token back to XRP via OfferCreate (fill-or-kill) using XRPL_WALLET_SEED. Enforces MAX_SELL_SLIPPAGE_BPS (default 300).",
+    parameters: {
+      type: "object",
+      properties: {
+        issuer: {
+          type: "string",
+          description: "Token issuer classic address",
+        },
+        currency: {
+          type: "string",
+          description: "Token currency code or 160-bit hex",
+        },
+        amountTokens: {
+          type: "number",
+          description: "Amount of tokens to sell",
+        },
+      },
+      required: ["issuer", "currency", "amountTokens"],
+    },
+    execute: sell_token,
   },
   {
     name: "check_balance",
