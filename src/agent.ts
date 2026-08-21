@@ -1,5 +1,9 @@
 import { systemTools } from "./tools/system";
 import { xrplTools } from "./tools/xrpl";
+import { marketTools } from "./tools/market";
+import { sentimentTools } from "./tools/sentiment";
+import { portfolioTools } from "./tools/portfolio";
+import { riskTools } from "./tools/risk";
 import type { AgentTool } from "./tools/types";
 
 const MAX_TOOL_ROUNDS = 8;
@@ -32,7 +36,14 @@ type OllamaChatResponse = {
   error?: string;
 };
 
-const tools: AgentTool[] = [...xrplTools, ...systemTools];
+const tools: AgentTool[] = [
+  ...xrplTools,
+  ...systemTools,
+  ...marketTools,
+  ...sentimentTools,
+  ...portfolioTools,
+  ...riskTools,
+];
 const toolsByName = new Map(tools.map((tool) => [tool.name, tool]));
 
 export function listTools(): Array<{ name: string; description: string }> {
