@@ -107,9 +107,8 @@ async function executeTool(name: string, args: Record<string, unknown>): Promise
   }
 }
 
-async function ollamaChat(messages: ChatMessage[]): Promise<OllamaChatResponse> {
+async function ollamaChat(messages: ChatMessage[], model: string): Promise<OllamaChatResponse> {
   const base = (process.env.OLLAMA_URL ?? "http://localhost:11434").replace(/\/$/, "");
-  const model = process.env.MODEL ?? "qwen2.5:7b";
   const response = await fetch(`${base}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -132,8 +131,11 @@ async function ollamaChat(messages: ChatMessage[]): Promise<OllamaChatResponse> 
   return body;
 }
 
-export async function runChat(prompt: string, context?: unknown): Promise<ChatResult> {
-  const model = process.env.MODEL ?? "qwen2.5:7b";
+export async function runChat(
+  prompt: string,
+  context?: unknown,
+  model: string = process.env.MODEL ?? "deepseek-r1:8b",
+): Promise<ChatResult> {
   const contextBlock = formatContext(context);
   const userContent = contextBlock
     ? `${prompt}\n\nContext:\n${contextBlock}`
@@ -157,7 +159,7 @@ export async function runChat(prompt: string, context?: unknown): Promise<ChatRe
   const toolsUsed: string[] = [];
 
   for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
-    const reply = await ollamaChat(messages);
+    const reply = await ollamaChat(messages, model);
     const message = reply.message ?? { role: "assistant", content: "" };
     messages.push(message);
 
