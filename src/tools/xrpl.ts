@@ -246,6 +246,14 @@ const LAUNCH_FRESH_MS = 5 * 60 * 1000;
 const AMMCREATE_LEDGERS = 90;
 const AMMCREATE_BATCH = 8;
 
+function truncateForLog(value: unknown, max = 2000): string {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  if (text.length <= max) {
+    return text;
+  }
+  return `${text.slice(0, max)}… (${text.length} chars)`;
+}
+
 function launchCreatedMs(launch: AmmLaunch): number | undefined {
   if (!launch.created_at) {
     return undefined;
@@ -272,33 +280,51 @@ function sortLaunchesByCreatedAtDesc(launches: AmmLaunch[]): AmmLaunch[] {
 }
 
 async function fetchExternalLaunches(limit: number): Promise<AmmLaunch[]> {
+  const source = "XMagnetic";
   const url = `https://api.geckoterminal.com/api/v2/networks/xrpl/new_pools?page=1`;
-  const response = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "Agent3/1.0 (Greenhead Labs)",
-    },
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (!response.ok) {
-    throw new Error(`Launch feed request failed (${response.status})`);
+  console.log("[get_launches] trying source:", source);
+  console.log("[get_launches] XMagnetic URL:", url);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Agent3/1.0 (Greenhead Labs)",
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const rawText = await response.text();
+    console.log("[get_launches] XMagnetic HTTP status:", response.status, response.statusText);
+    console.log("[get_launches] XMagnetic raw response:", truncateForLog(rawText));
+    if (!response.ok) {
+      throw new Error(`Launch feed request failed (${response.status})`);
+    }
+    const body = JSON.parse(rawText) as { data?: GeckoPool[] };
+    const launches = (body.data ?? []).slice(0, limit).map((pool) => {
+      const token = parseGeckoTokenId(pool.relationships?.base_token?.data?.id);
+      return {
+        name: pool.attributes?.name,
+        currency: token.currency,
+        issuer: token.issuer,
+        created_at: pool.attributes?.pool_created_at,
+        price_usd: pool.attributes?.base_token_price_usd,
+        price_xrp: pool.attributes?.base_token_price_native_currency,
+        fdv_usd: pool.attributes?.fdv_usd,
+        volume_usd_24h: pool.attributes?.volume_usd?.h24,
+        liquidity_usd: pool.attributes?.reserve_in_usd,
+        dex: pool.relationships?.dex?.data?.id,
+      };
+    });
+    console.log(
+      "[get_launches] XMagnetic parsed count:",
+      launches.length,
+      "launches:",
+      truncateForLog(launches),
+    );
+    return launches;
+  } catch (error) {
+    console.log("[get_launches] XMagnetic error:", error);
+    throw error;
   }
-  const body = (await response.json()) as { data?: GeckoPool[] };
-  return (body.data ?? []).slice(0, limit).map((pool) => {
-    const token = parseGeckoTokenId(pool.relationships?.base_token?.data?.id);
-    return {
-      name: pool.attributes?.name,
-      currency: token.currency,
-      issuer: token.issuer,
-      created_at: pool.attributes?.pool_created_at,
-      price_usd: pool.attributes?.base_token_price_usd,
-      price_xrp: pool.attributes?.base_token_price_native_currency,
-      fdv_usd: pool.attributes?.fdv_usd,
-      volume_usd_24h: pool.attributes?.volume_usd?.h24,
-      liquidity_usd: pool.attributes?.reserve_in_usd,
-      dex: pool.relationships?.dex?.data?.id,
-    };
-  });
 }
 
 function unwrapLedgerTx(entry: unknown): {
@@ -356,63 +382,110 @@ function ammCreateToLaunch(tx: {
 }
 
 async function fetchLedgerAmmCreates(limit: number): Promise<AmmLaunch[]> {
-  const xrpl = await getXrplClient();
-  const current = await xrpl.request({ command: "ledger", ledger_index: "validated" });
-  const latest = Number(current.result.ledger_index ?? current.result.ledger.ledger_index);
-  if (!Number.isFinite(latest) || latest <= 0) {
-    throw new Error("Could not read validated ledger index");
-  }
-
-  const found: AmmLaunch[] = [];
-  const oldest = Math.max(1, latest - AMMCREATE_LEDGERS + 1);
-
-  for (let batchHigh = latest; batchHigh >= oldest && found.length < limit; batchHigh -= AMMCREATE_BATCH) {
-    const batchLow = Math.max(oldest, batchHigh - AMMCREATE_BATCH + 1);
-    const indexes: number[] = [];
-    for (let index = batchHigh; index >= batchLow; index -= 1) {
-      indexes.push(index);
+  const source = "XRPL direct";
+  console.log("[get_launches] trying source:", source);
+  try {
+    const xrpl = await getXrplClient();
+    console.log(
+      "[get_launches] XRPL direct command:",
+      JSON.stringify({ command: "ledger", ledger_index: "validated" }),
+    );
+    const current = await xrpl.request({ command: "ledger", ledger_index: "validated" });
+    console.log("[get_launches] XRPL direct validated ledger response:", truncateForLog(current));
+    const latest = Number(current.result.ledger_index ?? current.result.ledger.ledger_index);
+    if (!Number.isFinite(latest) || latest <= 0) {
+      throw new Error("Could not read validated ledger index");
     }
 
-    const pages = await Promise.all(
-      indexes.map(async (ledgerIndex) => {
-        try {
-          return await xrpl.request({
-            command: "ledger",
-            ledger_index: ledgerIndex,
-            transactions: true,
-            expand: true,
-          });
-        } catch {
-          return null;
-        }
-      }),
+    const found: AmmLaunch[] = [];
+    const oldest = Math.max(1, latest - AMMCREATE_LEDGERS + 1);
+    const ledgerScanCommand = {
+      command: "ledger",
+      ledger_index: latest,
+      transactions: true,
+      expand: true,
+    };
+    console.log("[get_launches] XRPL direct command:", JSON.stringify(ledgerScanCommand));
+    console.log(
+      "[get_launches] XRPL direct scanning ledgers",
+      latest,
+      "to",
+      oldest,
+      "for AMMCreate (not account_tx)",
     );
 
-    for (const page of pages) {
-      if (!page) {
-        continue;
+    let loggedSampleLedger = false;
+    for (let batchHigh = latest; batchHigh >= oldest && found.length < limit; batchHigh -= AMMCREATE_BATCH) {
+      const batchLow = Math.max(oldest, batchHigh - AMMCREATE_BATCH + 1);
+      const indexes: number[] = [];
+      for (let index = batchHigh; index >= batchLow; index -= 1) {
+        indexes.push(index);
       }
-      const closeTime = page.result.ledger.close_time;
-      const createdAt =
-        typeof closeTime === "number" ? rippleTimeToISOTime(closeTime) : undefined;
-      const transactions = page.result.ledger.transactions ?? [];
-      for (const raw of transactions) {
-        if (typeof raw === "string") {
+
+      const pages = await Promise.all(
+        indexes.map(async (ledgerIndex) => {
+          try {
+            return await xrpl.request({
+              command: "ledger",
+              ledger_index: ledgerIndex,
+              transactions: true,
+              expand: true,
+            });
+          } catch (error) {
+            console.log("[get_launches] XRPL direct ledger request error:", ledgerIndex, error);
+            return null;
+          }
+        }),
+      );
+
+      for (const page of pages) {
+        if (!page) {
           continue;
         }
-        const tx = unwrapLedgerTx(raw);
-        if (tx.type !== "AMMCreate") {
-          continue;
+        const closeTime = page.result.ledger.close_time;
+        const createdAt =
+          typeof closeTime === "number" ? rippleTimeToISOTime(closeTime) : undefined;
+        const transactions = page.result.ledger.transactions ?? [];
+        if (!loggedSampleLedger) {
+          loggedSampleLedger = true;
+          console.log(
+            "[get_launches] XRPL direct raw ledger",
+            page.result.ledger_index ?? page.result.ledger.ledger_index,
+            "tx count:",
+            transactions.length,
+            "sample:",
+            truncateForLog(transactions.slice(0, 2)),
+          );
         }
-        const launch = ammCreateToLaunch(tx, createdAt);
-        if (launch) {
-          found.push(launch);
+        for (const raw of transactions) {
+          if (typeof raw === "string") {
+            continue;
+          }
+          const tx = unwrapLedgerTx(raw);
+          if (tx.type !== "AMMCreate") {
+            continue;
+          }
+          console.log("[get_launches] XRPL direct raw AMMCreate:", truncateForLog(raw));
+          const launch = ammCreateToLaunch(tx, createdAt);
+          if (launch) {
+            found.push(launch);
+          }
         }
       }
     }
-  }
 
-  return sortLaunchesByCreatedAtDesc(found).slice(0, limit);
+    const launches = sortLaunchesByCreatedAtDesc(found).slice(0, limit);
+    console.log(
+      "[get_launches] XRPL direct AMMCreate matches:",
+      launches.length,
+      "raw launches:",
+      truncateForLog(launches),
+    );
+    return launches;
+  } catch (error) {
+    console.log("[get_launches] XRPL direct error:", error);
+    throw error;
+  }
 }
 
 export async function get_xrp_price(
@@ -449,13 +522,32 @@ export async function get_launches(
   try {
     launches = await fetchExternalLaunches(limit);
   } catch (error) {
+    console.log("[get_launches] XMagnetic error caught:", error);
     externalError = error instanceof Error ? error.message : "external launch feed failed";
   }
 
-  if (externalError || launchesAreStale(launches)) {
+  const freshCount = launches.filter((launch) => isFreshLaunch(launch)).length;
+  const stale = Boolean(externalError) || launchesAreStale(launches);
+  console.log(
+    "[get_launches] XMagnetic parsed count:",
+    launches.length,
+    "fresh (<5m):",
+    freshCount,
+    "stale:",
+    stale,
+    "error:",
+    externalError ?? null,
+  );
+
+  if (stale) {
+    console.log(
+      "[get_launches] falling back to XRPL direct because:",
+      externalError ?? "external feed stale / 0 fresh AMM launches",
+    );
     try {
       launches = await fetchLedgerAmmCreates(limit);
     } catch (error) {
+      console.log("[get_launches] XRPL direct error caught:", error);
       if (launches.length === 0) {
         const fallbackError = error instanceof Error ? error.message : "XRPL AMMCreate scan failed";
         throw new Error(
@@ -466,6 +558,7 @@ export async function get_launches(
   }
 
   launches = sortLaunchesByCreatedAtDesc(launches).slice(0, limit);
+  console.log("[get_launches] returning count:", launches.length);
   return { count: launches.length, launches };
 }
 
@@ -842,7 +935,8 @@ export const xrplTools: AgentTool[] = [
   },
   {
     name: "get_launches",
-    description: "List recently launched XRPL tokens / AMM pools with price, liquidity, and issuer.",
+    description:
+      "List recently launched XRPL tokens / AMM pools. Prefers XMagnetic/GeckoTerminal new pools, then scans recent validated ledgers for AMMCreate (not account_tx).",
     parameters: {
       type: "object",
       properties: {
