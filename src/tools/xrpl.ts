@@ -226,7 +226,46 @@ function parseGeckoTokenId(id: string | undefined): { currency?: string; issuer?
   return { currency: decodeCurrency(currency), issuer };
 }
 
-async function getLaunches(args: Record<string, unknown>): Promise<unknown> {
+export type AmmLaunch = {
+  name?: string;
+  currency?: string;
+  issuer?: string;
+  created_at?: string;
+  price_usd?: string;
+  price_xrp?: string;
+  fdv_usd?: string;
+  volume_usd_24h?: string;
+  liquidity_usd?: string;
+  dex?: string;
+};
+
+export async function get_xrp_price(
+  _args: Record<string, unknown> = {},
+): Promise<{ priceUsd: number }> {
+  const response = await fetch(
+    "https://api.coingecko.com/api/v3/simple/price?ids=ripple&vs_currencies=usd",
+    {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Agent3/1.0 (Greenhead Labs)",
+      },
+      signal: AbortSignal.timeout(10_000),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`CoinGecko price request failed (${response.status})`);
+  }
+  const body = (await response.json()) as { ripple?: { usd?: number } };
+  const priceUsd = body.ripple?.usd;
+  if (typeof priceUsd !== "number" || !Number.isFinite(priceUsd)) {
+    throw new Error("CoinGecko did not return a numeric XRP/USD price");
+  }
+  return { priceUsd };
+}
+
+export async function get_launches(
+  args: Record<string, unknown> = {},
+): Promise<{ count: number; launches: AmmLaunch[] }> {
   const limit = Math.min(asInteger(args.limit, 10), 25);
   const url = `https://api.geckoterminal.com/api/v2/networks/xrpl/new_pools?page=1`;
   const response = await fetch(url, {
@@ -487,6 +526,20 @@ export const xrplTools: AgentTool[] = [
     execute: getPrice,
   },
   {
+    name: "get_xrp_price",
+    description: "Fetch the current XRP/USD price from CoinGecko. Returns { priceUsd: number }.",
+    parameters: {
+      type: "object",
+      properties: {
+        vs: {
+          type: "string",
+          description: "Quote currency. Always USD; included so the model can call the tool with an empty object.",
+        },
+      },
+    },
+    execute: get_xrp_price,
+  },
+  {
     name: "get_launches",
     description: "List recently launched XRPL tokens / AMM pools with price, liquidity, and issuer.",
     parameters: {
@@ -498,7 +551,7 @@ export const xrplTools: AgentTool[] = [
         },
       },
     },
-    execute: getLaunches,
+    execute: get_launches,
   },
   {
     name: "buy_token",
