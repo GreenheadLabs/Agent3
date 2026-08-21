@@ -1,0 +1,27 @@
+{
+  "name": "agent3",
+  "version": "1.0.0",
+  "description": "Agent3 local Ollama server with XRPL tools",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "postinstall": "npm run build",
+    "dev": "tsx watch src/index.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "typescript": "^5.9.2",
+    "xrpl": "^4.4.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.23",
+    "@types/node": "^22.17.2",
+    "tsx": "^4.20.5"
+  }
+}
