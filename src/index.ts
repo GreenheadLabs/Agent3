@@ -1,7 +1,17 @@
 import "dotenv/config";
 import express from "express";
+import { dropsToXrp } from "xrpl";
 import { listTools, runChat } from "./agent";
-import { get_launches, get_xrp_price } from "./tools/xrpl";
+import { score_token } from "./tools/risk";
+import {
+  buy_token,
+  get_launches,
+  get_xrp_price,
+  getXrplClient,
+  sell_token,
+  toXrplCurrency,
+  type AmmLaunch,
+} from "./tools/xrpl";
 
 const PORT = Number(process.env.PORT) || 3100;
 const MODEL = process.env.MODEL ?? "qwen2.5:7b";
@@ -213,9 +223,336 @@ app.post("/v1/decision", async (req, res) => {
   }
 });
 
+type OpenPosition = {
+  issuer: string;
+  currency: string;
+  tokens: number;
+  xrpSpent: number;
+  openedAt: number;
+  buyHash?: string;
+};
+
+const openPositions = new Map<string, OpenPosition>();
+const SCAN_MS = 60_000;
+const POSITION_CHECK_MS = 5 * 60_000;
+const MAX_LAUNCH_AGE_SECONDS = 5 * 60;
+const TAKE_PROFIT = 0.3;
+const STOP_LOSS = -0.2;
+
+function autoTradeEnabled(): boolean {
+  return process.env.AUTO_TRADE === "true";
+}
+
+function maxBuyXrp(): number {
+  const parsed = Number(process.env.MAX_BUY_XRP);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function positionKey(issuer: string, currency: string): string {
+  return `${issuer}:${currency}`;
+}
+
+function logDecision(event: string, details: Record<string, unknown>): void {
+  console.log(`[auto-trade] ${event}`, details);
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function launchAgeSeconds(createdAt: string | undefined): number | undefined {
+  if (!createdAt) {
+    return undefined;
+  }
+  const created = Date.parse(createdAt);
+  if (!Number.isFinite(created)) {
+    return undefined;
+  }
+  return (Date.now() - created) / 1000;
+}
+
+async function ammReserves(
+  currency: string,
+  issuer: string,
+): Promise<{ poolXrp: number; poolTokens: number } | null> {
+  try {
+    const xrpl = await getXrplClient();
+    const encoded = toXrplCurrency(currency);
+    const amm = await xrpl.request({
+      command: "amm_info",
+      asset: { currency: "XRP" },
+      asset2: { currency: encoded, issuer },
+    });
+    const amounts = [amm.result.amm.amount, amm.result.amm.amount2];
+    let poolXrp: number | undefined;
+    let poolTokens: number | undefined;
+    for (const amount of amounts) {
+      if (typeof amount === "string") {
+        poolXrp = Number(dropsToXrp(amount));
+      } else if (amount && typeof amount === "object" && "value" in amount) {
+        poolTokens = Number((amount as { value: string }).value);
+      }
+    }
+    if (poolXrp === undefined || poolTokens === undefined || poolXrp <= 0 || poolTokens <= 0) {
+      return null;
+    }
+    return { poolXrp, poolTokens };
+  } catch {
+    return null;
+  }
+}
+
+async function tokenPriceXrp(currency: string, issuer: string): Promise<number | null> {
+  const reserves = await ammReserves(currency, issuer);
+  if (!reserves || reserves.poolTokens <= 0) {
+    return null;
+  }
+  return reserves.poolXrp / reserves.poolTokens;
+}
+
+async function decideLaunch(input: DecisionInput, score: unknown): Promise<DecisionResult> {
+  const result = await runChat(
+    [
+      buildDecisionPrompt(input),
+      "You MUST call score_token with this issuer, currency, poolXrp, and poolTokens before deciding.",
+      "Do not call buy_token or sell_token.",
+    ].join("\n"),
+    {
+      system:
+        "Autonomous scan. Call score_token, then return JSON only: {decision, confidence, reason}.",
+      launch: input,
+      score_token: score,
+    },
+  );
+  try {
+    return normalizeDecision(
+      extractJsonObject(result.response),
+      result.response.trim() || "Unparseable model decision; skipping.",
+    );
+  } catch {
+    return {
+      decision: "skip",
+      confidence: 0,
+      reason: result.response.trim() || "Unparseable model decision; skipping.",
+    };
+  }
+}
+
+async function scanNewLaunches(): Promise<void> {
+  const feed = await get_launches({ limit: 25 });
+  const fresh = feed.launches.filter((launch: AmmLaunch) => {
+    const age = launchAgeSeconds(launch.created_at);
+    return Boolean(launch.issuer && launch.currency && age !== undefined && age >= 0 && age < MAX_LAUNCH_AGE_SECONDS);
+  });
+
+  logDecision("scan", { found: feed.launches.length, fresh: fresh.length });
+
+  for (const launch of fresh) {
+    const issuer = launch.issuer as string;
+    const currency = launch.currency as string;
+    const key = positionKey(issuer, currency);
+    const age = launchAgeSeconds(launch.created_at) ?? 0;
+    if (openPositions.has(key)) {
+      logDecision("skip", { currency, issuer, reason: "already holding an open position" });
+      continue;
+    }
+
+    const reserves = await ammReserves(currency, issuer);
+    const poolXrp = reserves?.poolXrp ?? (Number(launch.liquidity_usd) || 0);
+    const poolTokens = reserves?.poolTokens ?? 0;
+    const input: DecisionInput = {
+      issuer,
+      currency,
+      poolXrp,
+      poolTokens,
+      launchAgeSeconds: age,
+      source: launch.dex ?? "auto-trade",
+    };
+
+    let score: unknown;
+    try {
+      score = await score_token({
+        issuer,
+        currency,
+        poolXrp,
+        poolTokens,
+      });
+    } catch (error) {
+      logDecision("score_error", {
+        currency,
+        issuer,
+        error: error instanceof Error ? error.message : "score_token failed",
+      });
+      continue;
+    }
+
+    let decision: DecisionResult;
+    try {
+      decision = await decideLaunch(input, score);
+    } catch (error) {
+      decision = {
+        decision: "skip",
+        confidence: 0,
+        reason: error instanceof Error ? error.message : "Ollama decision failed",
+      };
+    }
+
+    logDecision("decision", {
+      currency,
+      issuer,
+      age_seconds: age,
+      score,
+      decision: decision.decision,
+      confidence: decision.confidence,
+      reason: decision.reason,
+    });
+
+    if (decision.decision !== "buy" || decision.confidence < 0.75) {
+      continue;
+    }
+
+    const xrpAmount = maxBuyXrp();
+    try {
+      const bought = asRecord(
+        await buy_token({
+          issuer,
+          currency,
+          xrp_amount: xrpAmount,
+        }),
+      );
+      const status = typeof bought.status === "string" ? bought.status : "unknown";
+      const hash = typeof bought.hash === "string" ? bought.hash : undefined;
+      const tokens = asFiniteNumber(bought.expected_tokens) ?? 0;
+      logDecision("buy", {
+        currency,
+        issuer,
+        xrp_amount: xrpAmount,
+        status,
+        txHash: hash,
+        reason: decision.reason,
+      });
+      if (status === "tesSUCCESS" && tokens > 0) {
+        openPositions.set(key, {
+          issuer,
+          currency,
+          tokens,
+          xrpSpent: xrpAmount,
+          openedAt: Date.now(),
+          buyHash: hash,
+        });
+      }
+    } catch (error) {
+      logDecision("buy_error", {
+        currency,
+        issuer,
+        error: error instanceof Error ? error.message : "buy_token failed",
+      });
+    }
+  }
+}
+
+async function checkOpenPositions(): Promise<void> {
+  if (openPositions.size === 0) {
+    logDecision("positions", { open: 0 });
+    return;
+  }
+
+  for (const [key, position] of [...openPositions.entries()]) {
+    try {
+      const price = await tokenPriceXrp(position.currency, position.issuer);
+      if (price === null || position.tokens <= 0 || position.xrpSpent <= 0) {
+        logDecision("position_skip", {
+          currency: position.currency,
+          issuer: position.issuer,
+          reason: "unable to mark position to market",
+        });
+        continue;
+      }
+      const markValue = position.tokens * price;
+      const upnl = (markValue - position.xrpSpent) / position.xrpSpent;
+      const action =
+        upnl > TAKE_PROFIT ? "take_profit" : upnl < STOP_LOSS ? "stop_loss" : "hold";
+      logDecision("position", {
+        currency: position.currency,
+        issuer: position.issuer,
+        upnl,
+        mark_xrp: markValue,
+        action,
+      });
+      if (action === "hold") {
+        continue;
+      }
+
+      const sold = asRecord(
+        await sell_token({
+          issuer: position.issuer,
+          currency: position.currency,
+          amountTokens: position.tokens,
+        }),
+      );
+      logDecision("sell", {
+        currency: position.currency,
+        issuer: position.issuer,
+        upnl,
+        reason: action,
+        status: sold.status,
+        txHash: sold.hash,
+      });
+      if (sold.status === "tesSUCCESS") {
+        openPositions.delete(key);
+      }
+    } catch (error) {
+      logDecision("sell_error", {
+        currency: position.currency,
+        issuer: position.issuer,
+        error: error instanceof Error ? error.message : "sell_token failed",
+      });
+    }
+  }
+}
+
+function startAutoTradeLoop(): void {
+  if (!autoTradeEnabled()) {
+    console.log("[auto-trade] disabled (set AUTO_TRADE=true to enable)");
+    return;
+  }
+
+  console.log("[auto-trade] enabled — scanning launches every 60s, positions every 5m");
+  let scanning = false;
+  let lastPositionCheck = Date.now();
+
+  const tick = async () => {
+    if (scanning) {
+      return;
+    }
+    scanning = true;
+    try {
+      await scanNewLaunches();
+      if (Date.now() - lastPositionCheck >= POSITION_CHECK_MS) {
+        lastPositionCheck = Date.now();
+        await checkOpenPositions();
+      }
+    } catch (error) {
+      logDecision("loop_error", {
+        error: error instanceof Error ? error.message : "auto-trade tick failed",
+      });
+    } finally {
+      scanning = false;
+    }
+  };
+
+  void tick();
+  setInterval(() => {
+    void tick();
+  }, SCAN_MS);
+}
+
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Agent3 listening on http://0.0.0.0:${PORT}`);
   console.log(`Model: ${MODEL}`);
+  startAutoTradeLoop();
 });
 
 function shutdown(signal: string) {
