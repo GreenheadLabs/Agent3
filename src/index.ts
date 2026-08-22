@@ -250,7 +250,7 @@ async function runSentiment(text: string): Promise<{
         { role: "user", content: text },
       ],
     }),
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(90_000),
   });
   const body = (await response.json()) as { message?: { content?: string }; error?: string };
   if (!response.ok) {
@@ -425,6 +425,7 @@ async function decideLaunch(input: DecisionInput, score: unknown): Promise<Decis
       launch: input,
       score_token: score,
     },
+    MODEL_FAST,
   );
   try {
     return normalizeDecision(

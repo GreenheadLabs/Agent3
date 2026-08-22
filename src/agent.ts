@@ -7,6 +7,7 @@ import { riskTools } from "./tools/risk";
 import type { AgentTool } from "./tools/types";
 
 const MAX_TOOL_ROUNDS = 8;
+const OLLAMA_TIMEOUT_MS = 90_000;
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant" | "tool";
@@ -118,7 +119,7 @@ async function ollamaChat(messages: ChatMessage[], model: string): Promise<Ollam
       tools: ollamaTools(),
       stream: false,
     }),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(OLLAMA_TIMEOUT_MS),
   });
 
   const body = (await response.json()) as OllamaChatResponse;
