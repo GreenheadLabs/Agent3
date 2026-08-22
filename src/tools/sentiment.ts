@@ -56,7 +56,7 @@ export async function analyze_sentiment(
   }
 
   const base = (process.env.OLLAMA_URL ?? "http://localhost:11434").replace(/\/$/, "");
-  const model = process.env.MODEL ?? "qwen2.5:7b";
+  const model = process.env.MODEL_FAST ?? "qwen2.5:7b";
   const response = await fetch(`${base}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -73,7 +73,7 @@ export async function analyze_sentiment(
         { role: "user", content: text },
       ],
     }),
-    signal: AbortSignal.timeout(60_000),
+    signal: AbortSignal.timeout(90_000),
   });
   const body = (await response.json()) as { message?: { content?: string }; error?: string };
   if (!response.ok) {
